@@ -3,7 +3,7 @@ import url from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 import { fetch } from "@remix-run/web-fetch";
-import { parseTarGzip } from "nanotar";
+import { parseTar, parseTarGzip } from "nanotar";
 import { ProxyAgent } from "proxy-agent";
 
 import { color, isUrl } from "./utils";
@@ -152,23 +152,26 @@ async function extractLocalTarball(
   destPath: string
 ): Promise<void> {
   try {
+    console.error("tarballPath", tarballPath);
     let tarball = await fs.promises.readFile(tarballPath);
-    let extract = await parseTarGzip(tarball);
+    // Some tarballs may be incorrectly named as tar.gz, so we need to parse appropriately
+    let extract = isGzip(tarball) ? await parseTarGzip(tarball) : parseTar(tarball);
 
     let extractionPromises = extract.map(async (file) => {
       let extractPath = path.join(destPath, file.name);
-      
-      // Just a directory, we still want to create empty folders
-      if (!file.data) {
-        await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
-      }
 
-      if (file.data) {
-        await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
-      
-        return fs.promises.writeFile(extractPath, file.data, {
-          mode: file.attrs?.mode,
+      // Data is only present on files, not directories
+      if (file.data && file.data.length > 0) {
+        // If the file has no extension, but has data, it should not create a directory
+        if (path.dirname(extractPath) !== extractPath) {
+          await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
+        }
+        return await fs.promises.writeFile(extractPath, file.data, {
+          mode: file.attrs?.mode?.trim(),
         });
+        
+      } else {
+        return await  fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
       }
     });
 
@@ -179,7 +182,7 @@ async function extractLocalTarball(
         `  Template filepath: \`${tarballPath}\`` +
         `  Destination directory: \`${destPath}\`` +
         `  ${error}`
-    );
+    ); 
   }
 }
 
@@ -317,20 +320,14 @@ async function downloadAndExtractTarball(
 
   try {
     let tarball = await response.arrayBuffer();
-    let extract = await parseTarGzip(tarball);
+    // Some tarballs may be incorrectly named as tar.gz, so we need to parse appropriately
+    let extract = isGzip(tarball) ? await parseTarGzip(tarball) : parseTar(tarball);
 
     let extractionPromises = extract.map(async (file) => {
       let extractPath = path.join(downloadPath, file.name);
-      
-      // Just a directory, we still want to create empty folders
-      if (!file.data) {
-        await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
-      }
-        
-      // data only exists if the file is a file, not a directory
-      if (file.data) {
-        let extractPath = path.join(downloadPath, file.name);
 
+      // Data is only present on files, not directories
+      if (file.data && file.data.length > 0) {
         if (filePath) {
             // Include trailing slash on startsWith when filePath doesn't include
             // it so something like `templates/remix` doesn't inadvertently
@@ -346,15 +343,20 @@ async function downloadAndExtractTarball(
             } else {
               return;
             }
-          }
+        }
+        
+        // If the file has no extension, but has data, it should not create a directory
+        if (path.dirname(extractPath) !== extractPath) {
+          await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
+        }
 
-        await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
         return fs.promises.writeFile(extractPath, file.data, {
-          mode: file.attrs?.mode,
+          mode: Number(file.attrs?.mode),
         });
+      } else {
+        return fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
       }
     });
-
     await Promise.all(extractionPromises);
   } catch (_) {
     throw new CopyTemplateError(
@@ -478,6 +480,17 @@ function getRepoInfo(validatedGithubUrl: string): RepoInfo {
     branch: branch!,
     filePath: filePath === "" || filePath === "/" ? null : filePath,
   };
+}
+
+function isGzip(buffer: Buffer | ArrayBuffer | Uint8Array): boolean {
+  let buf = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer;
+
+  if (buf.length < 3) {
+    return false;
+  }
+
+  // Check for gzip magic number
+  return buf[0] === 0x1F && buf[1] === 0x8B && buf[2] === 0x08;
 }
 
 export class CopyTemplateError extends Error {
