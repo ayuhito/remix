@@ -2,11 +2,8 @@ import process from "node:process";
 import url from "node:url";
 import fs from "node:fs";
 import path from "node:path";
-import stream from "node:stream";
-import { promisify } from "node:util";
 import { fetch } from "@remix-run/web-fetch";
-import gunzip from "gunzip-maybe";
-import tar from "tar-fs";
+import { parseTarGzip } from "nanotar";
 import { ProxyAgent } from "proxy-agent";
 
 import { color, isUrl } from "./utils";
@@ -150,18 +147,32 @@ async function copyTemplateFromLocalFilePath(
   );
 }
 
-const pipeline = promisify(stream.pipeline);
-
 async function extractLocalTarball(
   tarballPath: string,
   destPath: string
 ): Promise<void> {
   try {
-    await pipeline(
-      fs.createReadStream(tarballPath),
-      gunzip(),
-      tar.extract(destPath, { strip: 1 })
-    );
+    let tarball = await fs.promises.readFile(tarballPath);
+    let extract = await parseTarGzip(tarball);
+
+    let extractionPromises = extract.map(async (file) => {
+      let extractPath = path.join(destPath, file.name);
+      
+      // Just a directory, we still want to create empty folders
+      if (!file.data) {
+        await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
+      }
+
+      if (file.data) {
+        await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
+      
+        return fs.promises.writeFile(extractPath, file.data, {
+          mode: file.attrs?.mode,
+        });
+      }
+    });
+
+    await Promise.all(extractionPromises);
   } catch (error: unknown) {
     throw new CopyTemplateError(
       "There was a problem extracting the file from the provided template." +
@@ -305,44 +316,46 @@ async function downloadAndExtractTarball(
   let filePathHasFiles = false;
 
   try {
-    let input = new stream.PassThrough();
-    // Start reading stream into passthrough, don't await to avoid buffering
-    writeReadableStreamToWritable(response.body, input);
-    await pipeline(
-      input,
-      gunzip(),
-      tar.extract(downloadPath, {
-        map(header) {
-          let originalDirName = header.name.split("/")[0];
-          header.name = header.name.replace(`${originalDirName}/`, "");
+    let tarball = await response.arrayBuffer();
+    let extract = await parseTarGzip(tarball);
 
-          if (filePath) {
+    let extractionPromises = extract.map(async (file) => {
+      let extractPath = path.join(downloadPath, file.name);
+      
+      // Just a directory, we still want to create empty folders
+      if (!file.data) {
+        await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
+      }
+        
+      // data only exists if the file is a file, not a directory
+      if (file.data) {
+        let extractPath = path.join(downloadPath, file.name);
+
+        if (filePath) {
             // Include trailing slash on startsWith when filePath doesn't include
             // it so something like `templates/remix` doesn't inadvertently
             // include `templates/remix-javascript/*` files
             if (
               (filePath.endsWith(path.posix.sep) &&
-                header.name.startsWith(filePath)) ||
+                extractPath.startsWith(filePath)) ||
               (!filePath.endsWith(path.posix.sep) &&
-                header.name.startsWith(filePath + path.posix.sep))
+                extractPath.startsWith(filePath + path.posix.sep))
             ) {
               filePathHasFiles = true;
-              header.name = header.name.replace(filePath, "");
+              extractPath = extractPath.replace(filePath, "");
             } else {
-              header.name = "__IGNORE__";
+              return;
             }
           }
 
-          return header;
-        },
-        ignore(_filename, header) {
-          if (!header) {
-            throw Error("Header is undefined");
-          }
-          return header.name === "__IGNORE__";
-        },
-      })
-    );
+        await fs.promises.mkdir(path.dirname(extractPath), { recursive: true });
+        return fs.promises.writeFile(extractPath, file.data, {
+          mode: file.attrs?.mode,
+        });
+      }
+    });
+
+    await Promise.all(extractionPromises);
   } catch (_) {
     throw new CopyTemplateError(
       "There was a problem extracting the file from the provided template." +
@@ -357,34 +370,6 @@ async function downloadAndExtractTarball(
         isGithubUrl ? "GitHub repo." : "tarball."
       }`
     );
-  }
-}
-
-// Copied from remix-node/stream.ts
-async function writeReadableStreamToWritable(
-  stream: ReadableStream,
-  writable: stream.Writable
-) {
-  let reader = stream.getReader();
-  let flushable = writable as { flush?: Function };
-
-  try {
-    while (true) {
-      let { done, value } = await reader.read();
-
-      if (done) {
-        writable.end();
-        break;
-      }
-
-      writable.write(value);
-      if (typeof flushable.flush === "function") {
-        flushable.flush();
-      }
-    }
-  } catch (error: unknown) {
-    writable.destroy(error as Error);
-    throw error;
   }
 }
 
